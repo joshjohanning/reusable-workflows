@@ -15,8 +15,14 @@ the current repository. It:
    recompiled lock files).
 5. Updates other `github/gh-aw-actions/setup-cli` pins (SHA, version comment,
    `version:` input, and matching `--action-tag` SHAs) in non-lock workflow files.
-6. Opens a PR titled `chore: upgrade agentic workflows to gh-aw <version>` only
+6. Runs `gh aw compile --validate` and fails the run on errors, because
+   `gh aw upgrade` only warns when a codemod or compile fails.
+7. Opens a PR titled `chore: upgrade agentic workflows to gh-aw <version>` only
    when files change. It never merges, force-pushes, or closes existing PRs.
+
+If the compile fails, no PR is opened. Check the failed run's logs and fix the
+workflows by hand or with Copilot. Compiling can't catch changes in runtime
+behavior, so review the gh-aw release notes before merging an upgrade PR.
 
 Each PR uses a unique `gh-aw-upgrade/<version>-<run-id>-<attempt>` branch, so a
 closed, unmerged upgrade can be proposed again without overwriting prior work.

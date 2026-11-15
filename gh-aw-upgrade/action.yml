@@ -180,13 +180,22 @@ runs:
         done
         git --no-pager diff --stat
 
-    - name: Recompile with SHA-pinned gh-aw actions
-      if: steps.check.outputs.needed == 'true' && inputs.pin-actions-to-sha == 'true'
+    # gh aw upgrade only warns on codemod/compile failures, so compile again
+    # and fail the run rather than open a PR with broken lock files.
+    - name: Compile and validate
+      if: steps.check.outputs.needed == 'true'
       env:
         GH_TOKEN: ${{ inputs.token }}
+        PIN: ${{ inputs.pin-actions-to-sha }}
         NEW_SHA: ${{ steps.version.outputs.setup-cli-sha }}
       shell: bash
-      run: gh aw compile --no-check-update --action-mode action --action-tag "$NEW_SHA"
+      run: |
+        set -euo pipefail
+        args=(--validate --no-check-update)
+        if [ "$PIN" = "true" ]; then
+          args+=(--action-mode action --action-tag "$NEW_SHA")
+        fi
+        gh aw compile "${args[@]}"
 
     - name: Open pull request
       id: pr
