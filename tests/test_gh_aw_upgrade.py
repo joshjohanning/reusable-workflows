@@ -8,19 +8,19 @@ import textwrap
 import unittest
 
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/gh-aw-upgrade.yml"
+ACTION = Path(__file__).resolve().parents[1] / "gh-aw-upgrade/action.yml"
 OLD_SHA = "1" * 40
 NEW_SHA = "2" * 40
 
 
 def step_script(name):
-    text = WORKFLOW.read_text()
+    text = ACTION.read_text()
     match = re.search(
-        rf"^      - name: {re.escape(name)}\n(.*?)(?=^      - name: |\Z)",
+        rf"^    - name: {re.escape(name)}\n(.*?)(?=^    - name: |\Z)",
         text,
         re.MULTILINE | re.DOTALL,
     )
-    run = match.group(1).split("        run: |\n", 1)[1]
+    run = match.group(1).split("      run: |\n", 1)[1]
     return textwrap.dedent(run)
 
 
@@ -191,7 +191,7 @@ gh() {
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Review the diff", body.read_text())
             self.assertIn("\n\n", body.read_text())
-            self.assertIn("Co-authored-by: Copilot App", self.git("log", "-1", "--format=%B"))
+            self.assertNotIn("Co-authored-by", self.git("log", "-1", "--format=%B"))
             if first_commit is None:
                 first_commit = self.git("rev-parse", branch)
         self.assertEqual(self.git("rev-parse", "gh-aw-upgrade/v1.2.2-123-1"), first_commit)

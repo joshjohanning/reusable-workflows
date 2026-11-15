@@ -1,0 +1,215 @@
+name: Upgrade Agentic Workflows
+description: >-
+  Upgrade GitHub Agentic Workflows (gh-aw) in the current repository and open a
+  pull request for review. It never merges.
+
+# The caller chooses the token (PAT, GitHub App token, or github.token). It must
+# be able to push branches, update workflow files, and create pull requests.
+
+inputs:
+  token:
+    description: "Token used to check out, push, and open the PR. Needs contents, pull-requests, and workflows write; github.token cannot push workflow file changes."
+    required: true
+  gh-aw-version:
+    description: "gh-aw version to upgrade to (e.g. v1.2.2), or 'latest' for the latest stable release"
+    required: false
+    default: latest
+  approve:
+    description: "Pass --approve to gh aw upgrade to accept safe-update manifest changes"
+    required: false
+    default: "false"
+  pin-actions-to-sha:
+    description: "Recompile with --action-mode action --action-tag <setup-cli SHA> (for repos whose locks are compiled that way)"
+    required: false
+    default: "false"
+  base-branch:
+    description: "Branch to upgrade and target with the PR (defaults to the repository default branch)"
+    required: false
+    default: ""
+  git-user-name:
+    description: "Commit author name"
+    required: false
+    default: github-actions[bot]
+  git-user-email:
+    description: "Commit author email"
+    required: false
+    default: 41898282+github-actions[bot]@users.noreply.github.com
+
+outputs:
+  pull-request-url:
+    description: "URL of the opened upgrade PR, if any"
+    value: ${{ steps.pr.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.base-branch || github.event.repository.default_branch }}
+        token: ${{ inputs.token }}
+
+    - name: Resolve target gh-aw version
+      id: version
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REQUESTED: ${{ inputs.gh-aw-version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$REQUESTED" = "latest" ]; then
+          version="$(gh api repos/github/gh-aw/releases/latest --jq .tag_name)"
+        else
+          version="$REQUESTED"
+        fi
+        [[ "$version" == v* ]] || version="v${version}"
+        if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::Expected a stable gh-aw version such as v1.2.2, or latest."
+          exit 1
+        fi
+        # Prefer the peeled commit for annotated tags.
+        refs="$(git ls-remote https://github.com/github/gh-aw-actions.git "refs/tags/${version}" "refs/tags/${version}^{}")"
+        sha="$(awk '/\^\{\}$/ {print $1}' <<<"$refs")"
+        [ -n "$sha" ] || sha="$(awk 'NR==1 {print $1}' <<<"$refs")"
+        if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::Could not resolve github/gh-aw-actions tag ${version}."
+          exit 1
+        fi
+        echo "Target gh-aw version: $version ($sha)"
+        {
+          echo "version=$version"
+          echo "setup-cli-sha=$sha"
+          echo "branch=gh-aw-upgrade/${version}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Check whether an upgrade is needed
+      id: check
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.version.outputs.version }}
+        BASE: ${{ inputs.base-branch || github.event.repository.default_branch }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        existing="$(gh pr list --base "$BASE" --state open --json url,headRefName \
+          --jq '[.[] | select(.headRefName | startswith("gh-aw-upgrade/"))][0].url // ""')"
+        if [ -n "$existing" ]; then
+          echo "An upgrade PR is already open: $existing"
+          echo "needed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        shopt -s nullglob
+        locks=(.github/workflows/*.lock.yml)
+        if [ "${#locks[@]}" -eq 0 ]; then
+          echo "::error::No compiled agentic workflow lock files found in .github/workflows."
+          exit 1
+        fi
+
+        # Compiler versions alone do not capture stale validator pins or
+        # action updates. Let upgrade and the resulting diff decide.
+        echo "needed=true" >> "$GITHUB_OUTPUT"
+
+    - name: Install gh-aw
+      if: steps.check.outputs.needed == 'true'
+      uses: github/gh-aw-actions/setup-cli@53d0749e19424a918acd82b4d140264ce48f2f14 # v1.2.2
+      with:
+        version: ${{ steps.version.outputs.version }}
+        github-token: ${{ inputs.token }}
+
+    - name: Run gh aw upgrade
+      if: steps.check.outputs.needed == 'true'
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        APPROVE: ${{ inputs.approve }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        gh aw version
+        args=(--skip-extension-upgrade)
+        if [ "$APPROVE" = "true" ]; then
+          args+=(--approve)
+        fi
+        gh aw upgrade "${args[@]}"
+
+    - name: Sync remaining gh-aw setup-cli pins
+      if: steps.check.outputs.needed == 'true'
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.version.outputs.version }}
+        NEW_SHA: ${{ steps.version.outputs.setup-cli-sha }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # gh aw upgrade updates copilot-setup-steps.yml, but other workflows
+        # (e.g. compile validation) may also pin setup-cli or --action-tag.
+        shopt -s nullglob
+        files=(.github/workflows/*.yml .github/workflows/*.yaml)
+        for file in "${files[@]}"; do
+          [[ "$file" != *.lock.yml ]] || continue
+          if ! grep -q 'github/gh-aw-actions/setup-cli@' "$file"; then
+            continue
+          fi
+          mapfile -t old_shas < <(grep -oE 'github/gh-aw-actions/setup-cli@[0-9a-f]{40}' "$file" \
+            | sed 's/.*@//' | sort -u)
+          for old in "${old_shas[@]}"; do
+            sed -i -E "s|(--action-tag[[:space:]]+['\"]?)${old}|\1${NEW_SHA}|g" "$file"
+          done
+          sed -i -E \
+            -e "s|(github/gh-aw-actions/setup-cli@)[^[:space:]]+([[:space:]]+#.*)?$|\1${NEW_SHA} # ${VERSION}|" \
+            -e "/github\/gh-aw-actions\/setup-cli@/,/^[[:space:]]*- /s|^([[:space:]]*version:[[:space:]]*)(['\"]?v?[0-9]+\.[0-9]+\.[0-9]+['\"]?)([[:space:]]*(#.*)?)$|\1${VERSION}\3|" \
+            "$file"
+        done
+        git --no-pager diff --stat
+
+    - name: Recompile with SHA-pinned gh-aw actions
+      if: steps.check.outputs.needed == 'true' && inputs.pin-actions-to-sha == 'true'
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        NEW_SHA: ${{ steps.version.outputs.setup-cli-sha }}
+      shell: bash
+      run: gh aw compile --no-check-update --action-mode action --action-tag "$NEW_SHA"
+
+    - name: Open pull request
+      id: pr
+      if: steps.check.outputs.needed == 'true'
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.version.outputs.version }}
+        BRANCH: ${{ steps.version.outputs.branch }}
+        BASE: ${{ inputs.base-branch || github.event.repository.default_branch }}
+        GIT_NAME: ${{ inputs.git-user-name }}
+        GIT_EMAIL: ${{ inputs.git-user-email }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "$(git status --porcelain)" ]; then
+          echo "gh aw upgrade produced no changes."
+          exit 0
+        fi
+
+        git config user.name "$GIT_NAME"
+        git config user.email "$GIT_EMAIL"
+        git switch -c "$BRANCH"
+        mapfile -d '' -t files < <(git ls-files -z --modified --deleted --others --exclude-standard -- .github .gitattributes)
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "::error::Upgrade changed files outside the expected .github/.gitattributes paths."
+          exit 1
+        fi
+        git add -- "${files[@]}"
+        git diff --check --cached
+        git commit -m "chore: upgrade agentic workflows to gh-aw ${VERSION}"
+        git push --set-upstream origin "$BRANCH"
+
+        url="$(gh pr create --base "$BASE" --head "$BRANCH" \
+          --title "chore: upgrade agentic workflows to gh-aw ${VERSION}" \
+          --body-file - <<EOF
+        Automated upgrade of GitHub Agentic Workflows to [gh-aw ${VERSION}](https://github.com/github/gh-aw/releases/tag/${VERSION}).
+
+        Generated by \`gh aw upgrade\` (codemods, action pins, agent and skill files, recompiled lock files), plus syncing other \`github/gh-aw-actions/setup-cli\` pins to ${VERSION}.
+
+        Review the diff and CI results before merging.
+        EOF
+        )"
+        echo "Opened $url"
+        echo "url=$url" >> "$GITHUB_OUTPUT"
