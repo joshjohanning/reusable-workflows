@@ -91,7 +91,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        existing="$(gh pr list --base "$BASE" --state open --json url,headRefName \
+        existing="$(gh pr list --base "$BASE" --state open --limit 1000 --json url,headRefName \
           --jq '[.[] | select(.headRefName | startswith("gh-aw-upgrade/"))][0].url // ""')"
         if [ -n "$existing" ]; then
           echo "An upgrade PR is already open: $existing"
@@ -156,9 +156,27 @@ runs:
             sed -i -E "s|(--action-tag[[:space:]]+['\"]?)${old}|\1${NEW_SHA}|g" "$file"
           done
           sed -i -E \
-            -e "s|(github/gh-aw-actions/setup-cli@)[^[:space:]]+([[:space:]]+#.*)?$|\1${NEW_SHA} # ${VERSION}|" \
-            -e "/github\/gh-aw-actions\/setup-cli@/,/^[[:space:]]*- /s|^([[:space:]]*version:[[:space:]]*)(['\"]?v?[0-9]+\.[0-9]+\.[0-9]+['\"]?)([[:space:]]*(#.*)?)$|\1${VERSION}\3|" \
+            "s|(github/gh-aw-actions/setup-cli@)[^[:space:]'\"]+(['\"]?)([[:space:]]+#.*)?$|\1${NEW_SHA}\2 # ${VERSION}|" \
             "$file"
+          # Rewrite version: only inside the setup-cli step, which ends at the
+          # first non-comment line indented less than its uses: key.
+          awk -v ver="$VERSION" -v q="'" '
+            function indent(s) { match(s, /^ */); return RLENGTH }
+            BEGIN { k = -1; num = "^[\"" q "]?v?[0-9]+\\.[0-9]+\\.[0-9]+[\"" q "]?" }
+            {
+              line = $0
+              if (k >= 0 && line ~ /[^[:space:]]/ && line !~ /^[[:space:]]*#/ && indent(line) < k) k = -1
+              if (k >= 0 && match(line, /^[[:space:]]*version:[[:space:]]*/)) {
+                prefix = substr(line, 1, RLENGTH); rest = substr(line, RLENGTH + 1)
+                if (match(rest, num)) {
+                  suffix = substr(rest, RLENGTH + 1)
+                  if (suffix ~ /^[[:space:]]*(#.*)?$/) line = prefix ver suffix
+                }
+              }
+              if (line ~ /github\/gh-aw-actions\/setup-cli@/) k = index(line, "uses:") - 1
+              print line
+            }' "$file" > "$file.tmp"
+          mv "$file.tmp" "$file"
         done
         git --no-pager diff --stat
 
