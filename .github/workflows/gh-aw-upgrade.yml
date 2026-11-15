@@ -55,6 +55,9 @@ jobs:
     if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: gh-aw-upgrade-${{ github.repository }}-${{ inputs.base-branch || github.event.repository.default_branch }}
+      cancel-in-progress: false
     outputs:
       pull-request-url: ${{ steps.pr.outputs.url }}
     steps:
@@ -117,11 +120,16 @@ jobs:
           else
             version="$REQUESTED"
           fi
+          [[ "$version" == v* ]] || version="v${version}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected a stable gh-aw version such as v1.2.2, or latest."
+            exit 1
+          fi
           # Prefer the peeled commit for annotated tags.
           refs="$(git ls-remote https://github.com/github/gh-aw-actions.git "refs/tags/${version}" "refs/tags/${version}^{}")"
           sha="$(awk '/\^\{\}$/ {print $1}' <<<"$refs")"
           [ -n "$sha" ] || sha="$(awk 'NR==1 {print $1}' <<<"$refs")"
-          if [ -z "$sha" ]; then
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Could not resolve github/gh-aw-actions tag ${version}."
             exit 1
           fi
@@ -129,7 +137,7 @@ jobs:
           {
             echo "version=$version"
             echo "setup-cli-sha=$sha"
-            echo "branch=gh-aw-upgrade/${version}"
+            echo "branch=gh-aw-upgrade/${version}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check whether an upgrade is needed
@@ -137,12 +145,13 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.auth.outputs.token }}
           VERSION: ${{ steps.version.outputs.version }}
-          BRANCH: ${{ steps.version.outputs.branch }}
+          BASE: ${{ inputs.base-branch || github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          existing="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // ""')"
+          existing="$(gh pr list --base "$BASE" --state open --json url,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("gh-aw-upgrade/"))][0].url // ""')"
           if [ -n "$existing" ]; then
-            echo "Upgrade PR for $VERSION is already open: $existing"
+            echo "An upgrade PR is already open: $existing"
             echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -154,14 +163,9 @@ jobs:
             exit 1
           fi
 
-          needed=false
-          for lock in "${locks[@]}"; do
-            if ! grep -q "\"compiler_version\":\"${VERSION}\"" "$lock"; then
-              echo "$lock is not compiled with $VERSION"
-              needed=true
-            fi
-          done
-          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+          # Compiler versions alone do not capture stale validator pins or
+          # action updates. Let upgrade and the resulting diff decide.
+          echo "needed=true" >> "$GITHUB_OUTPUT"
 
       - name: Install gh-aw
         if: steps.check.outputs.needed == 'true'
@@ -193,19 +197,21 @@ jobs:
           set -euo pipefail
           # gh aw upgrade updates copilot-setup-steps.yml, but other workflows
           # (e.g. compile validation) may also pin setup-cli or --action-tag.
-          mapfile -t files < <(grep -lE 'github/gh-aw-actions/setup-cli@' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null | grep -v '\.lock\.yml$' || true)
-          if [ "${#files[@]}" -eq 0 ]; then
-            exit 0
-          fi
-          mapfile -t old_shas < <(grep -ohE 'github/gh-aw-actions/setup-cli@[0-9a-f]{40}' "${files[@]}" \
-            | sed 's/.*@//' | sort -u | grep -vx "$NEW_SHA" || true)
+          shopt -s nullglob
+          files=(.github/workflows/*.yml .github/workflows/*.yaml)
           for file in "${files[@]}"; do
+            [[ "$file" != *.lock.yml ]] || continue
+            if ! grep -q 'github/gh-aw-actions/setup-cli@' "$file"; then
+              continue
+            fi
+            mapfile -t old_shas < <(grep -oE 'github/gh-aw-actions/setup-cli@[0-9a-f]{40}' "$file" \
+              | sed 's/.*@//' | sort -u)
             for old in "${old_shas[@]}"; do
-              sed -i "s/${old}/${NEW_SHA}/g" "$file"
+              sed -i -E "s|(--action-tag[[:space:]]+['\"]?)${old}|\1${NEW_SHA}|g" "$file"
             done
             sed -i -E \
-              -e "s|(github/gh-aw-actions/setup-cli@${NEW_SHA}) # v[0-9][^ ]*|\1 # ${VERSION}|" \
-              -e "/github\/gh-aw-actions\/setup-cli@/,/^[[:space:]]*- /s|^([[:space:]]*version:[[:space:]]*)['\"]?v[0-9]+\.[0-9]+\.[0-9]+[^'\" ]*['\"]?[[:space:]]*$|\1${VERSION}|" \
+              -e "s|(github/gh-aw-actions/setup-cli@)[^[:space:]]+([[:space:]]+#.*)?$|\1${NEW_SHA} # ${VERSION}|" \
+              -e "/github\/gh-aw-actions\/setup-cli@/,/^[[:space:]]*- /s|^([[:space:]]*version:[[:space:]]*)(['\"]?v?[0-9]+\.[0-9]+\.[0-9]+['\"]?)([[:space:]]*(#.*)?)$|\1${VERSION}\3|" \
               "$file"
           done
           git --no-pager diff --stat
@@ -237,11 +243,15 @@ jobs:
           git config user.name "$GIT_NAME"
           git config user.email "$GIT_EMAIL"
           git switch -c "$BRANCH"
-          git add --all -- .github
-          if [ -f .gitattributes ]; then
-            git add -- .gitattributes
+          mapfile -d '' -t files < <(git ls-files -z --modified --deleted --others --exclude-standard -- .github .gitattributes)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::Upgrade changed files outside the expected .github/.gitattributes paths."
+            exit 1
           fi
-          git commit -m "chore: upgrade agentic workflows to gh-aw ${VERSION}"
+          git add -- "${files[@]}"
+          git diff --check --cached
+          git commit -m "chore: upgrade agentic workflows to gh-aw ${VERSION}" \
+            -m "Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>"
           git push --set-upstream origin "$BRANCH"
 
           url="$(gh pr create --base "$BASE" --head "$BRANCH" \
@@ -256,10 +266,3 @@ jobs:
           )"
           echo "Opened $url"
           echo "url=$url" >> "$GITHUB_OUTPUT"
-
-          # Close older upgrade PRs that this one supersedes.
-          gh pr list --state open --json number,headRefName \
-            --jq ".[] | select(.headRefName | startswith(\"gh-aw-upgrade/\")) | select(.headRefName != \"${BRANCH}\") | .number" \
-            | while read -r number; do
-                gh pr close "$number" --delete-branch --comment "Superseded by $url."
-              done
